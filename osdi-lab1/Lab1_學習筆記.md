@@ -1,6 +1,6 @@
-# Lab 1 學習筆記：Hello World（進行中，目前完成 required 1，required 2 開工）
+# Lab 1 學習筆記：Hello World（required 1~3 全部完成，已用 QEMU 實測成功）
 
-程式碼現況存在 `osdi-lab1-progress/`（`boot.S`、`linker.ld`、`main.c`、`mmio.h`，都已加好註解），對應你自己手上正在寫的那份。
+程式碼最終版存在 `osdi-lab1-progress/`（`boot.S`、`linker.ld`、`main.c`、`uart.c`/`uart.h`、`utils.c`/`utils.h`、`mmio.h`，都已加好註解），對應你自己手上寫的那份，在沙盒裡重新編譯驗證過（entry point `0x80000`、無編譯警告）。
 
 ## required 1：基本初始化（已完成並驗證）
 
@@ -144,8 +144,142 @@ static inline unsigned int mmio_read(unsigned long reg) {
 
 `#ifndef MMIO_H` / `#define MMIO_H` / `#endif` 是 include guard，避免同一個 header 被多個 `.c` 檔重複引入時內容重複定義而報錯。
 
-### 接下來（還沒做）
+### GPIO 設定（ALT5）與 mini UART 暫存器初始化
 
-- 寫 `uart_init()`：設定 GPIO14/15 為 ALT5（mini UART 功能）、關閉 pull up/down、依序設定 mini UART 的暫存器（AUX_ENABLES、AUX_MU_IER_REG、AUX_MU_LCR_REG、AUX_MU_BAUD_REG...）。
-- 寫 `uart_putc`/`uart_getc`：靠讀寫 `AUX_MU_LSR_REG` 的旗標位元，判斷可不可以送/收資料。
-- 寫一個能讀一行輸入的簡易 shell，支援 `help`/`hello` 指令（required 3）。
+`uart_init()` 分兩段：先把 GPIO14/15 切成 ALT5（mini UART 功能），再依序設定 mini UART 本體的暫存器。
+
+**GPIO 部分**：`GPFSEL1` 這個暫存器一次管好幾根 GPIO 腳位（每根佔 3 個 bit），所以要用 **read-modify-write（讀-改-寫）** 模式：先讀出目前完整的 32-bit 內容，只修改我們關心的那幾個 bit，其他 bit 保持原樣，最後才整個寫回去——如果沒有先讀就直接蓋，會把其他沒打算動的腳位設定也弄壞。
+
+```c
+unsigned int selector = mmio_read(GPFSEL1);
+selector &= ~(7u << 12);   // 清空 GPIO14 的 3 個 bit（先蓋成 0）
+selector |= (2u << 12);    // 填入 ALT5 編碼 (0b010)
+selector &= ~(7u << 15);   // GPIO15 同理
+selector |= (2u << 15);
+mmio_write(GPFSEL1, selector); // 只有這一行才是真正動到硬體
+```
+
+接著關閉這兩根腳位原本的 pull up/down 電阻設定（改成 alternate function 後不需要）：官方文件規定的兩段式流程——寫入控制值(`GPPUD`)、等待、寫入要套用到哪幾根腳位的遮罩(`GPPUDCLK0`)、等待、清空 `GPPUDCLK0` 完成鎖存。
+
+**mini UART 本體**：依序設定 `AUX_ENABLES`（開電源）、`AUX_MU_IER_REG`（關中斷）、`AUX_MU_CNTL_REG`（設定期間先關收發）、`AUX_MU_LCR_REG`（8-bit 資料長度）、`AUX_MU_MCR_REG`（不用流量控制）、`AUX_MU_BAUD_REG`（傳輸速率）、`AUX_MU_IIR_REG`（不用 FIFO）、最後再開收發功能。
+
+`AUX_MU_BAUD_REG` 設成 `270` 不是隨便選的：
+
+```
+baud rate = 系統時脈 / (8 × (AUX_MU_BAUD_REG + 1))
+115200    = 250000000 / (8 × (270 + 1))
+```
+
+開機後系統時脈是 250MHz，反推要湊出業界常用的 115200 baud，算出來就是 270。這個 115200 之後在電腦端連線（QEMU 或終端機軟體）也要設定一致。
+
+驗證：反組譯逐行核對每個暫存器位址（例如 `AUX_ENABLES` = `0x3F215004`）跟寫入的數值，全部跟原始碼一一對上，位元遮罩（`0xffff8fff`、`0xfffc7fff` 等）也都跟 `~(7u << 12)` 這類運算式算出來的結果一致。
+
+### `uart_putc`/`uart_getc`：忙碑等待（busy-wait / polling）
+
+```c
+void uart_putc(char c) {
+    while (!(mmio_read(AUX_MU_LSR_REG) & (1u << 5))) { } // bit5 = 傳輸暫存器空了嗎
+    mmio_write(AUX_MU_IO_REG, (unsigned int)c);
+}
+
+char uart_getc(void) {
+    while (!(mmio_read(AUX_MU_LSR_REG) & 1u)) { }        // bit0 = 有新資料嗎
+    return (char)(mmio_read(AUX_MU_IO_REG) & 0xFF);
+}
+```
+
+`AUX_MU_LSR_REG`（Line Status Register）的旗標位元隨時反映硬體狀態。`while(!(...))` 這種「一直問硬體準備好了沒」的寫法叫忙碑等待——陽春但直觀，Lab 3 學中斷後會有更有效率的做法。
+
+**資料實際去哪裡了**：`uart_putc` 寫進 `AUX_MU_IO_REG`，這個動作讓 mini UART 硬體把資料透過 TX 接腳（GPIO14）送出去；真實 Pi 上經 USB-TTL 線送到電腦的序列埠，QEMU 則是攔截這個位址的寫入，轉送到 `-serial` 參數指定的目的地（我們用 `-serial null -serial stdio`，接到執行 QEMU 的 Terminal 視窗）。`uart_getc` 方向相反：讀同一個暫存器，硬體已經先把外部傳進來的 byte 準備好在那裡。
+
+### `uart_readline`：組合成一整行
+
+```c
+int uart_readline(char *buf, int max_len) {
+    int i = 0;
+    while (1) {
+        char c = uart_getc();
+        if (c == '\r' || c == '\n') {          // Enter：結束這一行
+            uart_putc('\r'); uart_putc('\n');
+            break;
+        }
+        if (c == 0x7F || c == 0x08) {          // Backspace：刪掉上一個字元
+            if (i > 0) { i--; uart_puts("\b \b"); }
+            continue;
+        }
+        if (i < max_len - 1) {
+            buf[i++] = c;
+            uart_putc(c);                       // echo：讓使用者看到自己打的字
+        }
+    }
+    buf[i] = '\0';                              // 補上字串結尾記號
+    return i;
+}
+```
+
+寫這支函式時踩過的坑，記錄一下：
+
+- **不能用 `c == '\0'` 判斷「輸入結束」**：`'\0'` 是我們事後才加上去的字串結尾記號，鍵盤打不出這個字元，使用者按 Enter 送出的是 `'\r'`/`'\n'`，要判斷這個才對。
+- **不能拿指標直接跟長度比大小**（例如 `buf < maxlen`）：`buf` 是位址、`maxlen` 是數量，單位不同，比較沒有意義。要另外維護一個索引 `i`，用 `buf[i++] = c` 存取，`buf` 這個指標本身不要移動，不然函式結束後呼叫端拿到的指標就跑到字串尾端去了。
+- **忘記補 `'\0'`**：字串陣列裡沒有結尾記號的話，之後 `str_eq` 之類的函式無法知道字串在哪裡結束，會讀到不可預期的內容。
+
+### `str_eq`：自己刻的字串比對
+
+bare-metal 沒有 libc，`strcmp` 用不了：
+
+```c
+int str_eq(const char *a, const char *b) {
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++;
+        b++;
+    }
+    return *a == *b; // 兩邊要「同時」走到結尾的 '\0' 才算真的相等
+}
+```
+
+最後那行容易忽略：如果只用「有沒有走到某一邊的結尾」判斷，會把類似 `"hell"` 跟 `"hello"` 這種一個是另一個前綴的情況誤判成相等。要兩邊同時是 `'\0'` 才算數。
+
+### 整合成 shell（required 3，已用 QEMU 實測成功）
+
+`main.c` 用 read-eval loop 的結構：印提示字元 `# ` → 讀一行 → 跟已知指令比對 → 執行 → 重複。
+
+```c
+int main(void) {
+    char line[LINE_MAX];   // 區域變數，配置在 stack 上
+    uart_init();
+    uart_puts("\n=== NCTU OSDI Lab 1 - Hello World Shell ===\n");
+    while (1) {
+        uart_puts("# ");
+        uart_readline(line, LINE_MAX);
+        handle_command(line);
+    }
+}
+```
+
+`char line[LINE_MAX]` 這個區域陣列會被放上 stack——這也回頭印證了 Lab 1 一開始為什麼要先在 `boot.S` 設好 `sp` 才能呼叫 `main`：沒有正確的 stack，這種陣列的空間根本無從分配。
+
+**實際跑出來的結果**（用 `qemu-system-aarch64 -M raspi3b -kernel kernel8.img -serial null -serial stdio -display none`）：
+
+```
+=== NCTU OSDI Lab 1 - Hello World Shell ===
+Type 'help' to get started.
+# help
+Available commands:
+  help   - print all available commands
+  hello  - print Hello World!
+# hello
+Hello World!
+#
+```
+
+跟課程 required 3 的要求（`help`/`hello` 兩個指令）完全吻合。從最開始一行 `wfe` 的無窮迴圈，到現在能互動的 shell，required 1~3 全部完成並實測驗證。
+
+## 還沒做的部分（elective，非必要）
+
+- `timestamp` 指令：讀 `CNTFRQ_EL0`（計時器頻率）跟 `CNTPCT_EL0`（目前計數），算出開機後經過的時間。
+- `reboot` 指令：透過 PM_RSTC/PM_WDOG 暫存器觸發重開機（只在真實 rpi3 上有效，QEMU 不支援）。
+
+## 下一步
+
+Lab 2：Bootloader——學怎麼用 mailbox 跟 GPU 要硬體資訊，以及寫一個能透過 UART 直接上傳新 kernel image 的 bootloader。
